@@ -20,25 +20,43 @@
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const binary = path.join(path.dirname(fileURLToPath(import.meta.url)), 'forge');
 
 // The binary may arrive without its executable bit (a web upload stores it
 // as a plain file), and spawn would then fail with EACCES before the suite
-// ever sees a port. Make it executable first; if that fails, let the spawn
-// below try anyway and report the error as before.
+// ever sees a port. Make it executable first; if the checkout is read-only
+// (a trial pod mounts /bot read-only, so chmod in place fails silently),
+// copy the binary into a fresh temp directory, make the copy executable
+// there, and run that instead. If every fallback fails, let the spawn
+// below try the original path anyway and report the error as before.
+let runnable = binary;
 try {
   fs.accessSync(binary, fs.constants.X_OK);
 } catch {
   try {
     fs.chmodSync(binary, 0o755);
   } catch {
-    // Fall through: spawn will surface the real error.
+    // The checkout may be read-only; fall through to the copy below.
+  }
+  try {
+    fs.accessSync(binary, fs.constants.X_OK);
+  } catch {
+    try {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'github-forge-'));
+      const copy = path.join(dir, 'forge');
+      fs.copyFileSync(binary, copy);
+      fs.chmodSync(copy, 0o755);
+      runnable = copy;
+    } catch {
+      // Fall through: spawn will surface the real error.
+    }
   }
 }
 
-const child = spawn(binary, process.argv.slice(2), {
+const child = spawn(runnable, process.argv.slice(2), {
   stdio: 'inherit',
   env: process.env,
 });
