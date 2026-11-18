@@ -19,9 +19,24 @@
 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
 import path from 'node:path';
 
 const binary = path.join(path.dirname(fileURLToPath(import.meta.url)), 'forge');
+
+// The binary may arrive without its executable bit (a web upload stores it
+// as a plain file), and spawn would then fail with EACCES before the suite
+// ever sees a port. Make it executable first; if that fails, let the spawn
+// below try anyway and report the error as before.
+try {
+  fs.accessSync(binary, fs.constants.X_OK);
+} catch {
+  try {
+    fs.chmodSync(binary, 0o755);
+  } catch {
+    // Fall through: spawn will surface the real error.
+  }
+}
 
 const child = spawn(binary, process.argv.slice(2), {
   stdio: 'inherit',
