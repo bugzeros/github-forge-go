@@ -7,12 +7,12 @@ package main
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const viewerLogin = "adaiversen"
@@ -410,10 +410,120 @@ func issueJSONBytes(r *repo, i *issue) []byte {
 	if i.jsonCache != nil && i.jsonCacheSeq == i.updatedSeq && i.jsonCacheNCom == len(i.comments) {
 		return i.jsonCache
 	}
-	b, _ := json.Marshal(issueJSON(r, i))
+	b := issueJSONBuf(r, i)
 	i.jsonCache = b
 	i.jsonCacheSeq = i.updatedSeq
 	i.jsonCacheNCom = len(i.comments)
+	return b
+}
+
+// appendJSONString appends s as a JSON string literal, escaping exactly
+// like encoding/json does with HTML escaping on (\" \\ \n \r \t, control
+// bytes as \u00XX, < > & as \u003c \u003e \u0026, U+2028/U+2029, invalid
+// UTF-8 bytes as the raw U+FFFD bytes), so the bytes match
+// json.Marshal's output.
+func appendJSONString(b []byte, s string) []byte {
+	const hexd = "0123456789abcdef"
+	b = append(b, '"')
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c < 0x80 {
+			switch c {
+			case '"':
+				b = append(b, '\\', '"')
+			case '\\':
+				b = append(b, '\\', '\\')
+			case '\n':
+				b = append(b, '\\', 'n')
+			case '\r':
+				b = append(b, '\\', 'r')
+			case '\t':
+				b = append(b, '\\', 't')
+			case '<':
+				b = append(b, '\\', 'u', '0', '0', '3', 'c')
+			case '>':
+				b = append(b, '\\', 'u', '0', '0', '3', 'e')
+			case '&':
+				b = append(b, '\\', 'u', '0', '0', '2', '6')
+			default:
+				if c < 0x20 {
+					b = append(b, '\\', 'u', '0', '0', hexd[c>>4], hexd[c&0xf])
+				} else {
+					b = append(b, c)
+				}
+			}
+			i++
+			continue
+		}
+		rn, size := utf8.DecodeRuneInString(s[i:])
+		if rn == utf8.RuneError && size == 1 {
+			// encoding/json writes the replacement character itself
+			// (the raw U+FFFD bytes), not the \ufffd escape.
+			b = append(b, 0xef, 0xbf, 0xbd)
+			i++
+			continue
+		}
+		if rn == '\u2028' || rn == '\u2029' {
+			b = append(b, '\\', 'u', '2', '0', '2', '8')
+			if rn == '\u2029' {
+				b[len(b)-1] = '9'
+			}
+			i += size
+			continue
+		}
+		b = append(b, s[i:i+size]...)
+		i += size
+	}
+	return append(b, '"')
+}
+
+// issueJSONBuf serializes one issue to exactly the bytes
+// json.Marshal(issueJSON(r, i)) produces — same keys in encoding/json's
+// sorted order, same escaping — but by appending to a buffer instead of
+// building maps and reflecting over them. The write workload (200
+// sequential issue POSTs) and the single-issue GET cache both use it.
+func issueJSONBuf(r *repo, i *issue) []byte {
+	b := make([]byte, 0, 512)
+	b = append(b, `{"assignee":null,"assignees":[],"body":`...)
+	b = appendJSONString(b, i.body)
+	b = append(b, `,"comments":`...)
+	b = strconv.AppendInt(b, int64(len(i.comments)), 10)
+	b = append(b, `,"created_at":`...)
+	b = appendJSONString(b, db.isoFor(i.createdSeq))
+	b = append(b, `,"html_url":`...)
+	b = appendJSONString(b, "https://github.com/"+r.fullName()+"/issues/"+strconv.Itoa(i.number))
+	b = append(b, `,"id":`...)
+	b = strconv.AppendInt(b, int64(i.id), 10)
+	b = append(b, `,"labels":[`...)
+	for j, name := range i.labels {
+		if j > 0 {
+			b = append(b, ',')
+		}
+		color := "ededed"
+		if l, ok := r.labels[name]; ok {
+			color = l.color
+		}
+		b = append(b, `{"color":`...)
+		b = appendJSONString(b, color)
+		b = append(b, `,"name":`...)
+		b = appendJSONString(b, name)
+		b = append(b, '}')
+	}
+	b = append(b, `],"number":`...)
+	b = strconv.AppendInt(b, int64(i.number), 10)
+	b = append(b, `,"state":`...)
+	b = appendJSONString(b, i.state)
+	b = append(b, `,"title":`...)
+	b = appendJSONString(b, i.title)
+	b = append(b, `,"updated_at":`...)
+	b = appendJSONString(b, db.isoFor(i.updatedSeq))
+	b = append(b, `,"url":`...)
+	b = appendJSONString(b, "https://api.github.com/repos/"+r.fullName()+"/issues/"+strconv.Itoa(i.number))
+	b = append(b, `,"user":{"id":`...)
+	b = strconv.AppendInt(b, int64(viewerID), 10)
+	b = append(b, `,"login":`...)
+	b = appendJSONString(b, viewerLogin)
+	b = append(b, `,"type":"User"}}`...)
 	return b
 }
 

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ---------------------------------------------------------------------------
@@ -93,20 +94,63 @@ func sidebandWrap(data []byte) []byte {
 // Packfiles
 // ---------------------------------------------------------------------------
 
+// zlibPool holds zlib readers for pack inflation. A push inflates every
+// object of its pack, and a workload inflates hundreds of packs, so the
+// reader is pooled instead of built fresh per object; Reset re-reads the
+// header, so semantics match zlib.NewReader exactly (including the
+// adler32 check and the exact input position after the stream).
+var zlibPool = sync.Pool{}
+
 // inflateOne inflates one zlib stream starting at start and reports the
 // input bytes consumed. Go's flate reads byte-by-byte from a *bytes.Reader,
-// so the position after ReadAll is exact (verified empirically).
-func inflateOne(buf []byte, start int) ([]byte, int, error) {
+// so the position after the stream is exact (verified empirically).
+// size is the object's declared uncompressed size from the pack header;
+// when it is sane the output buffer is pre-sized instead of grown by
+// io.ReadAll, and a byte past it must be EOF (a longer stream is corrupt).
+func inflateOne(buf []byte, start, size int) ([]byte, int, error) {
 	r := bytes.NewReader(buf[start:])
-	zr, err := zlib.NewReader(r)
-	if err != nil {
-		return nil, 0, err
+	var zr io.ReadCloser
+	if v := zlibPool.Get(); v != nil {
+		zr = v.(io.ReadCloser)
+		if rs, ok := zr.(zlib.Resetter); ok {
+			if err := rs.Reset(r, nil); err != nil {
+				return nil, 0, err
+			}
+		} else {
+			zr2, err := zlib.NewReader(r)
+			if err != nil {
+				return nil, 0, err
+			}
+			zr = zr2
+		}
+	} else {
+		zr2, err := zlib.NewReader(r)
+		if err != nil {
+			return nil, 0, err
+		}
+		zr = zr2
 	}
-	data, err := io.ReadAll(zr)
-	zr.Close()
-	if err != nil {
-		return nil, 0, err
+	var data []byte
+	if size >= 0 && size <= 64<<20 {
+		data = make([]byte, size)
+		if _, err := io.ReadFull(zr, data); err != nil {
+			return nil, 0, err
+		}
+		extra := make([]byte, 1)
+		if n, err := zr.Read(extra); n != 0 || (err != nil && err != io.EOF) {
+			if err == nil || n != 0 {
+				return nil, 0, errors.New("pack object size mismatch")
+			}
+			return nil, 0, err
+		}
+	} else {
+		var err error
+		data, err = io.ReadAll(zr)
+		if err != nil {
+			return nil, 0, err
+		}
 	}
+	zlibPool.Put(zr)
 	consumed := len(buf) - start - r.Len()
 	return data, start + consumed, nil
 }
@@ -141,7 +185,12 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 	if srcSize != len(base) {
 		return nil, errors.New("delta base size mismatch")
 	}
+	// Pre-size the output when the declared size is sane (a corrupt delta
+	// naming gigabytes would otherwise allocate it all before failing).
 	var out []byte
+	if dstSize >= 0 && dstSize <= 16<<20 {
+		out = make([]byte, 0, dstSize)
+	}
 	for p < len(delta) {
 		op := delta[p]
 		p++
@@ -243,7 +292,7 @@ func readPack(buf []byte, r *repo) (map[string]*gitObj, error) {
 		} else if _, ok := packTypeByID[typeID]; !ok {
 			return nil, errors.New("unknown pack type")
 		}
-		data, next, err := inflateOne(buf, pos)
+		data, next, err := inflateOne(buf, pos, size)
 		if err != nil {
 			return nil, err
 		}

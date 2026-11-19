@@ -12,19 +12,26 @@ import (
 
 var token = os.Getenv("MAKEFUN_SHOP_TOKEN")
 
+// The two authorization spellings the suite sends, built once so the
+// per-request auth check allocates nothing.
+var bearerToken = "Bearer " + token
+var tokenToken = "token " + token
+
 func authed(req *request) bool {
 	if token == "" {
 		return true
 	}
-	return req.auth == "Bearer "+token || req.auth == "token "+token
+	return req.auth == bearerToken || req.auth == tokenToken
 }
 
 // jsonResp builds an application/json response with a fresh request id.
+// The id travels as resp.reqID (rendered by serializeHeader), not as a
+// built header string.
 func jsonResp(status int, body []byte) *response {
 	return &response{
 		status: status, ctype: "application/json",
-		headers: [][2]string{{"X-GitHub-Request-Id", "req-" + strconv.FormatInt(db.nextReq(), 10)}},
-		body:    body,
+		reqID:  db.nextReq(),
+		body:   body,
 	}
 }
 
@@ -948,7 +955,7 @@ func handleIssues(req *request, r *repo, rest []string, q map[string]string) *re
 			}
 			r.issues = append(r.issues, iss)
 			r.issuesByNum[iss.number] = iss
-			return jsonOK(201, issueJSON(r, iss))
+			return jsonResp(201, issueJSONBuf(r, iss))
 		}
 		return jsonErr(404, "Not Found")
 	}

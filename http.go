@@ -39,11 +39,14 @@ type request struct {
 }
 
 // response is what a handler returns; the server serializes it.
+// reqID is the per-request counter rendered as the X-GitHub-Request-Id
+// header by serializeHeader, so no request-id string is ever built.
 type response struct {
 	status  int
 	ctype   string // "" means no content-type header
 	headers [][2]string // extra headers, in order
 	body    []byte
+	reqID   int64 // 0 means no X-GitHub-Request-Id header
 }
 
 func (r *response) header(k, v string) {
@@ -77,6 +80,11 @@ func serialize(b []byte, req *request, resp *response) []byte {
 // Content-Length) to b.
 func serializeHeader(b []byte, req *request, resp *response) []byte {
 	b = writeStatusLine(b, resp.status)
+	if resp.reqID != 0 {
+		b = append(b, "X-GitHub-Request-Id: req-"...)
+		b = strconv.AppendInt(b, resp.reqID, 10)
+		b = append(b, "\r\n"...)
+	}
 	if resp.ctype != "" {
 		b = append(b, "Content-Type: "...)
 		b = append(b, resp.ctype...)
@@ -132,19 +140,69 @@ func trimCRLF(b []byte) []byte {
 	return b
 }
 
-func lowerASCII(b []byte) string {
-	// Header names are short; build a lowercased copy.
-	out := make([]byte, len(b))
-	for i, c := range b {
+// headerNameEq reports whether the raw header name equals s,
+// case-insensitively, without allocating. equalFoldBytes does the same
+// for a header value. atoiBytes parses a non-negative decimal from bytes.
+func headerNameEq(b []byte, s string) bool {
+	if len(b) != len(s) {
+		return false
+	}
+	for i := range b {
+		c := b[i]
 		if c >= 'A' && c <= 'Z' {
 			c += 'a' - 'A'
 		}
-		out[i] = c
+		if c != s[i] {
+			return false
+		}
 	}
-	return string(out)
+	return true
+}
+
+func equalFoldBytes(b []byte, s string) bool { return headerNameEq(b, s) }
+
+func atoiBytes(b []byte) (int, bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	n := 0
+	for _, c := range b {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, true
+}
+
+// containsFoldBytes reports whether b contains sub, case-insensitively.
+func containsFoldBytes(b []byte, sub string) bool {
+	if len(sub) == 0 || len(b) < len(sub) {
+		return false
+	}
+	for i := 0; i+len(sub) <= len(b); i++ {
+		match := true
+		for j := 0; j < len(sub); j++ {
+			c := b[i+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != sub[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // parseRequest reads one request (headers + body) from r.
+// Header names are matched on the raw bytes (no lowercasing copy) and
+// only the values the forge keeps are converted to strings, so a
+// request with no interesting headers allocates nothing here.
 func parseRequest(r *bufio.Reader) (*request, error) {
 	line, err := readLine(r)
 	if err != nil {
@@ -199,32 +257,34 @@ func parseRequest(r *bufio.Reader) (*request, error) {
 		if colon < 0 {
 			continue
 		}
-		name := lowerASCII(hline[:colon])
-		value := strings.TrimLeft(string(hline[colon+1:]), " \t")
-		switch name {
-		case "authorization":
-			req.auth = value
-		case "content-length":
-			if n, err := strconv.Atoi(value); err == nil && n >= 0 {
+		name := hline[:colon]
+		value := hline[colon+1:]
+		for len(value) > 0 && (value[0] == ' ' || value[0] == '\t') {
+			value = value[1:]
+		}
+		switch {
+		case headerNameEq(name, "authorization"):
+			req.auth = string(value)
+		case headerNameEq(name, "content-length"):
+			if n, ok := atoiBytes(value); ok && n >= 0 {
 				req.contentLength = n
 			}
-		case "transfer-encoding":
-			if strings.Contains(strings.ToLower(value), "chunked") {
+		case headerNameEq(name, "transfer-encoding"):
+			if containsFoldBytes(value, "chunked") {
 				req.chunked = true
 			}
-		case "connection":
-			lv := strings.ToLower(value)
-			if strings.Contains(lv, "close") {
+		case headerNameEq(name, "connection"):
+			if containsFoldBytes(value, "close") {
 				req.close = true
 			}
-		case "git-protocol":
-			req.gitProto = value
-		case "content-type":
-			req.ctype = value
-		case "host":
-			req.host = value
-		case "expect":
-			if strings.EqualFold(value, "100-continue") {
+		case headerNameEq(name, "git-protocol"):
+			req.gitProto = string(value)
+		case headerNameEq(name, "content-type"):
+			req.ctype = string(value)
+		case headerNameEq(name, "host"):
+			req.host = string(value)
+		case headerNameEq(name, "expect"):
+			if equalFoldBytes(value, "100-continue") {
 				req.expectContinue = true
 			}
 		}

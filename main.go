@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -36,27 +37,56 @@ func splitPath(p string) []string {
 
 // matchIssueGet recognizes GET /api/v3/repos/{owner}/{repo}/issues/{number}
 // directly on the path string, without allocating segment or query maps.
-// This is the read workload's hot path (2,000 sequential GETs).
+// This is the read workload's hot path (2,000 sequential GETs). It scans
+// the four segments with indexByte instead of strings.Split, so the
+// common case allocates nothing at all.
 func matchIssueGet(path string) (owner, name, num string, ok bool) {
 	const prefix = "/api/v3/repos/"
 	if !strings.HasPrefix(path, prefix) {
 		return "", "", "", false
 	}
 	rest := path[len(prefix):]
-	// owner/repo/issues/number — exactly 4 segments, no query (already split).
-	parts := strings.Split(rest, "/")
-	if len(parts) != 4 || parts[2] != "issues" {
+	// owner/repo/issues/number — exactly 4 segments.
+	s1 := indexByteStr(rest, '/')
+	if s1 < 0 {
 		return "", "", "", false
 	}
-	if parts[0] == "" || parts[1] == "" || parts[3] == "" {
+	s2 := indexByteStr(rest[s1+1:], '/')
+	if s2 < 0 {
 		return "", "", "", false
 	}
-	for _, c := range parts[3] {
-		if c < '0' || c > '9' {
+	s2 += s1 + 1
+	s3 := indexByteStr(rest[s2+1:], '/')
+	if s3 < 0 {
+		return "", "", "", false
+	}
+	s3 += s2 + 1
+	if indexByteStr(rest[s3+1:], '/') >= 0 {
+		return "", "", "", false
+	}
+	if rest[s2+1:s3] != "issues" {
+		return "", "", "", false
+	}
+	owner, name, num = rest[:s1], rest[s1+1:s2], rest[s3+1:]
+	if owner == "" || name == "" || num == "" {
+		return "", "", "", false
+	}
+	for i := 0; i < len(num); i++ {
+		if num[i] < '0' || num[i] > '9' {
 			return "", "", "", false
 		}
 	}
-	return parts[0], parts[1], parts[3], true
+	return owner, name, num, true
+}
+
+// indexByteStr is indexByte over a string (no allocation).
+func indexByteStr(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
 }
 
 // fastIssueGet serves a cached issue GET under a read lock. It returns
@@ -197,6 +227,10 @@ func waitForSuite(envURL string) {
 }
 
 func main() {
+	// The store is small (tens of MB) and the pod allows 1024 MB, so let
+	// the heap grow further between collections: fewer GC cycles on the
+	// timed workloads, at no risk to the memory limit.
+	debug.SetGCPercent(400)
 	suiteURL := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
 	if suiteURL == "" {
 		port := standalonePort()
